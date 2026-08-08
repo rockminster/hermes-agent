@@ -1,5 +1,6 @@
 """Focused tests for API server session-control endpoints."""
 
+import asyncio
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -90,6 +91,39 @@ async def test_delete_session_stops_associated_active_run(adapter, session_db):
     assert response.status == 200
     assert session_id in adapter._stopping_run_ids
     assert session_db.get_session(session_id) is None
+
+
+@pytest.mark.asyncio
+async def test_delete_session_cancels_inflight_session_chat(adapter, session_db):
+    """Deleting a session must cancel an already-issued chat continuation."""
+    session_id = "session_chat_cleanup"
+    session_db.create_session(session_id, "api_server")
+    release = asyncio.Event()
+
+    async def pending_chat():
+        await release.wait()
+
+    task = asyncio.create_task(pending_chat())
+
+    class InterruptibleAgent:
+        def __init__(self):
+            self.reason = None
+
+        def hard_interrupt(self, reason=None):
+            self.reason = reason
+
+    agent = InterruptibleAgent()
+    adapter._active_session_chats[session_id] = {task: [agent]}
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        response = await cli.delete(f"/api/sessions/{session_id}")
+
+    assert response.status == 200
+    assert agent.reason == "Session deleted via API"
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert session_id not in adapter._active_session_chats
 
 
 @pytest.mark.asyncio
@@ -623,4 +657,3 @@ async def test_require_model_lock_hard_fails_when_global_default_would_be_used(a
             body = await resp.json()
             assert body["error"]["code"] in {"model_lock_unavailable", "invalid_model_lock", "missing_model"}
     mock_run.assert_not_called()
-

@@ -1421,6 +1421,11 @@ class APIServerAdapter(BasePlatformAdapter):
         # Active run agent/task references for stop support
         self._active_run_agents: Dict[str, Any] = {}
         self._active_run_tasks: Dict[str, "asyncio.Task"] = {}
+        # Session-chat requests are synchronous API turns rather than
+        # /v1/runs, so they need their own cancellation index. Otherwise a
+        # deleted watchdog session can keep its already-issued continuation
+        # running and recreate the deleted row in the background.
+        self._active_session_chats: Dict[str, Dict["asyncio.Task", Optional[list]]] = {}
         # Stop is cooperative: the executor thread may outlive the HTTP request.
         self._stopping_run_ids: set[str] = set()
         # Pollable run status for dashboards and external control-plane UIs.
@@ -3485,6 +3490,21 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         for run_id in run_ids:
             self._stop_active_run(run_id, reason="Session deleted via API")
+        # Session-chat turns do not have a structured run id, but they still
+        # own an asyncio task and (once created) an AIAgent. Interrupt both
+        # before deleting the durable row so an in-flight watchdog
+        # continuation cannot append messages after this request returns.
+        active_chat = self._active_session_chats.pop(session_id, {})
+        current_task = asyncio.current_task()
+        for task, agent_ref in active_chat.items():
+            agent = agent_ref[0] if agent_ref else None
+            if agent is not None:
+                try:
+                    request_hard_interrupt(agent, "Session deleted via API")
+                except Exception:
+                    logger.debug("failed to interrupt deleted session agent", exc_info=True)
+            if task is not current_task and not task.done():
+                task.cancel()
         db = await self._ensure_session_db_async()
         deleted = await asyncio.to_thread(db.delete_session, session_id)
         return web.json_response({"object": "hermes.session.deleted", "id": session_id, "deleted": bool(deleted)})
@@ -3625,11 +3645,13 @@ class APIServerAdapter(BasePlatformAdapter):
             if selection_error:
                 return web.json_response(_openai_error(selection_error), status=400)
         history = await self._conversation_history_for_session(session_id)
+        agent_ref = [None]
         result, usage = await self._run_agent(
             user_message=user_message,
             conversation_history=history,
             ephemeral_system_prompt=system_prompt,
             session_id=session_id,
+            agent_ref=agent_ref,
             gateway_session_key=gateway_session_key,
             route=route,
             session_model=session_model,
@@ -6050,6 +6072,9 @@ class APIServerAdapter(BasePlatformAdapter):
         # run_in_executor threads, so the profile scope must be re-entered
         # inside _run() from this explicit value.
         request_profile = _api_request_profile.get()
+        session_task = asyncio.current_task()
+        if session_id and session_task is not None:
+            self._active_session_chats.setdefault(session_id, {})[session_task] = agent_ref
 
         def _run():
             from gateway.session_context import clear_session_vars
@@ -6223,6 +6248,12 @@ class APIServerAdapter(BasePlatformAdapter):
             return await loop.run_in_executor(None, _run)
         finally:
             self._inflight_agent_runs -= 1
+            if session_id and session_task is not None:
+                active = self._active_session_chats.get(session_id)
+                if active is not None:
+                    active.pop(session_task, None)
+                    if not active:
+                        self._active_session_chats.pop(session_id, None)
 
     # ------------------------------------------------------------------
     # /v1/runs — structured event streaming
