@@ -2806,6 +2806,27 @@ class APIServerAdapter(BasePlatformAdapter):
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
 
+        # Native API callers may narrow the tool surface for a single turn
+        # through model_options.  This is deliberately request-scoped: the
+        # API server's configured toolsets remain the default for normal
+        # sessions, while bounded machine-readable hand-offs can use an
+        # explicit empty list without disabling tools for repository work.
+        if isinstance(model_options, dict):
+            requested_enabled = model_options.get("enabled_toolsets")
+            requested_disabled = model_options.get("disabled_toolsets")
+            if isinstance(requested_enabled, list) and all(
+                isinstance(item, str) and item.strip() for item in requested_enabled
+            ):
+                enabled_toolsets = list(dict.fromkeys(item.strip() for item in requested_enabled))
+            if isinstance(requested_disabled, list) and all(
+                isinstance(item, str) and item.strip() for item in requested_disabled
+            ):
+                disabled_toolsets = list(dict.fromkeys(item.strip() for item in requested_disabled))
+            else:
+                disabled_toolsets = None
+        else:
+            disabled_toolsets = None
+
         max_iterations = _current_max_iterations()
 
         # Load fallback provider chain so the API server platform has the
@@ -2825,6 +2846,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "verbose_logging": False,
             "ephemeral_system_prompt": ephemeral_system_prompt or None,
             "enabled_toolsets": enabled_toolsets,
+            "disabled_toolsets": disabled_toolsets,
             "session_id": session_id,
             "platform": "api_server",
             "stream_delta_callback": stream_delta_callback,
@@ -2836,6 +2858,14 @@ class APIServerAdapter(BasePlatformAdapter):
             "reasoning_config": reasoning_config,
             "gateway_session_key": gateway_session_key,
         }
+        # Allow bounded API clients to request provider-level JSON mode without
+        # exposing arbitrary agent constructor kwargs.  This is intentionally
+        # opt-in and request-scoped; normal sessions keep the configured
+        # provider behaviour.
+        if isinstance(model_options, dict) and model_options.get("json_mode") is True:
+            agent_kwargs["request_overrides"] = {
+                "extra_body": {"response_format": {"type": "json_object"}}
+            }
         if request_service_tier is not _REQUEST_OPTION_MISSING:
             agent_kwargs["service_tier"] = request_service_tier
 
@@ -3442,6 +3472,19 @@ class APIServerAdapter(BasePlatformAdapter):
         session, err = await self._get_existing_session_or_404(session_id)
         if err:
             return err
+        # Session deletion is also used as the final cleanup boundary by
+        # local contract clients. Do not leave a /v1/runs task (and its
+        # underlying oMLX request) alive after its persisted session has been
+        # deleted. A run normally uses its own generated session id, but also
+        # honour an explicitly supplied session_id.
+        run_ids = [session_id]
+        run_ids.extend(
+            run_id
+            for run_id, status in self._run_statuses.items()
+            if status.get("session_id") == session_id and run_id != session_id
+        )
+        for run_id in run_ids:
+            self._stop_active_run(run_id, reason="Session deleted via API")
         db = await self._ensure_session_db_async()
         deleted = await asyncio.to_thread(db.delete_session, session_id)
         return web.json_response({"object": "hermes.session.deleted", "id": session_id, "deleted": bool(deleted)})
@@ -5927,6 +5970,7 @@ class APIServerAdapter(BasePlatformAdapter):
         chat_id: str = "",
         session_key: str = "",
         session_id: str = "",
+        source: str = "api_server",
     ) -> list:
         """Bind session contextvars for an API-server agent run.
 
@@ -5947,6 +5991,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return set_session_vars(
             platform="api_server",
+            source=source.strip()[:128] or "api_server",
             chat_id=chat_id,
             session_key=session_key,
             session_id=session_id,
@@ -6431,6 +6476,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # Background task outlives the HTTP response (and thus the middleware
         # profile scope). Capture now and re-enter inside the task/executor.
         request_profile = _api_request_profile.get()
+        request_source = str(request.headers.get("X-Hermes-Session-Source", "")).strip()
 
         async def _run_and_close():
             try:
@@ -6520,6 +6566,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                 chat_id=session_id or "",
                                 session_key=approval_session_key,
                                 session_id=session_id or "",
+                                source=request_source or "api_server",
                             )
                             register_gateway_notify(approval_session_key, _approval_notify)
                             # /v1/runs runs its own agent lifecycle (no
@@ -6864,30 +6911,26 @@ class APIServerAdapter(BasePlatformAdapter):
             return auth_err
 
         run_id = request.match_info["run_id"]
+        if not self._stop_active_run(run_id, reason="Stop requested via API"):
+            return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
+        return web.json_response({"run_id": run_id, "status": "stopping"})
+
+    def _stop_active_run(self, run_id: str, *, reason: str) -> bool:
+        """Interrupt an active run and mark it for cooperative cancellation."""
         agent = self._active_run_agents.get(run_id)
         task = self._active_run_tasks.get(run_id)
-
         if agent is None and task is None:
-            return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
+            return False
 
         self._set_run_status(run_id, "stopping", last_event="run.stopping")
         self._stopping_run_ids.add(run_id)
-
         if agent is not None:
             try:
-                request_hard_interrupt(agent, "Stop requested via API")
+                request_hard_interrupt(agent, reason)
             except Exception:
                 pass
-            # The stopped run is abandoned — reap only the background
-            # processes it created (#76115). Epoch-gated inside, so a
-            # concurrent run sharing the same session_id keeps its own
-            # processes; no-op if the run already finished and cleared
-            # its ownership markers.
-            _reap_disconnected_agent_processes(
-                agent, source="api_server_run_stop"
-            )
-
-        return web.json_response({"run_id": run_id, "status": "stopping"})
+            _reap_disconnected_agent_processes(agent, source="api_server_run_stop")
+        return True
 
     async def _sweep_orphaned_runs(self) -> None:
         """Periodically expire transport buffers and terminal status records."""

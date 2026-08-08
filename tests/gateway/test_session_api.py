@@ -76,6 +76,23 @@ async def test_capabilities_advertises_session_control_surface(adapter):
 
 
 @pytest.mark.asyncio
+async def test_delete_session_stops_associated_active_run(adapter, session_db):
+    """Deleting a persisted run session must not leave its model request live."""
+    session_id = "run_session_cleanup"
+    session_db.create_session(session_id, "develop-machine")
+    adapter._run_statuses[session_id] = {"session_id": session_id, "status": "running"}
+    adapter._active_run_tasks[session_id] = object()
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        response = await cli.delete(f"/api/sessions/{session_id}")
+
+    assert response.status == 200
+    assert session_id in adapter._stopping_run_ids
+    assert session_db.get_session(session_id) is None
+
+
+@pytest.mark.asyncio
 async def test_run_agent_binds_api_session_context_for_tool_env(adapter, monkeypatch):
     """API-server request sessions should reach tools and terminal subprocess env."""
     monkeypatch.setenv("HERMES_SESSION_ID", "stale-session")
@@ -606,5 +623,4 @@ async def test_require_model_lock_hard_fails_when_global_default_would_be_used(a
             body = await resp.json()
             assert body["error"]["code"] in {"model_lock_unavailable", "invalid_model_lock", "missing_model"}
     mock_run.assert_not_called()
-
 
