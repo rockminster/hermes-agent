@@ -9,7 +9,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter
-from hermes_state import SessionDB
+from hermes_state import SessionDB, SessionDeletedError
 
 
 @pytest.fixture
@@ -124,6 +124,21 @@ async def test_delete_session_cancels_inflight_session_chat(adapter, session_db)
     with pytest.raises(asyncio.CancelledError):
         await task
     assert session_id not in adapter._active_session_chats
+
+
+def test_delete_session_tombstones_late_executor_writes(session_db):
+    """A cancelled executor must not recreate a row after DELETE returns."""
+    session_id = "late_executor_cannot_resurrect"
+    session_db.create_session(session_id, "session-watchdog")
+
+    assert session_db.delete_session(session_id) is True
+    assert session_db.get_session(session_id) is None
+
+    with pytest.raises(SessionDeletedError):
+        session_db.create_session(session_id, "session-watchdog")
+
+    with pytest.raises(SessionDeletedError):
+        session_db.append_message(session_id, "assistant", "late result")
 
 
 @pytest.mark.asyncio
