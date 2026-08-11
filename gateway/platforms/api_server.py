@@ -94,6 +94,7 @@ from gateway.platforms.base import (
 from agent.redact import redact_sensitive_text
 from agent.interrupt_compat import request_hard_interrupt
 from gateway.readiness import collect_runtime_readiness
+from gateway.turn_lease import SessionTurnLeaseRegistry
 
 from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
 from agent.secret_scope import get_secret as _scoped_get_secret
@@ -1447,6 +1448,16 @@ class APIServerAdapter(BasePlatformAdapter):
         # deleted watchdog session can keep its already-issued continuation
         # running and recreate the deleted row in the background.
         self._active_session_chats: Dict[str, Dict["asyncio.Task", Optional[list]]] = {}
+        # SessionDB owns one durable transcript per session id.  Every API
+        # surface below can reach that same row (including watchdog wake-ups),
+        # so serialise turns by resolved session id before any agent work
+        # starts.  The gateway's platform guards are routing-key scoped and do
+        # not see two callers that use different keys for the same persisted
+        # session.  Without this lease, concurrent model turns can race
+        # compression and transcript persistence, producing the misleading
+        # "session is being compressed by another writer" failure.
+        self._session_turn_leases = SessionTurnLeaseRegistry()
+        self._session_turn_generation = itertools.count(1)
         # Stop is cooperative: the executor thread may outlive the HTTP request.
         self._stopping_run_ids: set[str] = set()
         # Pollable run status for dashboards and external control-plane UIs.
@@ -6053,6 +6064,32 @@ class APIServerAdapter(BasePlatformAdapter):
             cron_session="",
         )
 
+    async def _acquire_session_turn_lease(
+        self,
+        session_id: Optional[str],
+        *,
+        owner_key: str,
+    ):
+        """Serialise API turns that target the same durable session.
+
+        The lease is deliberately acquired in the event-loop layer, before
+        the worker thread creates an agent or writes transcript state.  It is
+        shared by synchronous chat, streaming chat, and structured runs so a
+        watchdog continuation cannot overlap the turn it is meant to recover.
+        """
+        if not session_id:
+            return None
+        generation = next(self._session_turn_generation)
+        return await self._session_turn_leases.acquire(
+            session_id,
+            owner_key=owner_key or "api_server",
+            generation=generation,
+        )
+
+    def _release_session_turn_lease(self, token) -> None:
+        if token is not None:
+            self._session_turn_leases.release(token)
+
     async def _run_agent(
         self,
         user_message: str,
@@ -6276,12 +6313,17 @@ class APIServerAdapter(BasePlatformAdapter):
                         _clear_turn_process_ownership(agent)
                     clear_session_vars(tokens)
 
+        turn_lease = await self._acquire_session_turn_lease(
+            session_id,
+            owner_key=gateway_session_key or session_source or session_id or "api_server",
+        )
         self._activate_admitted_request()
         self._inflight_agent_runs += 1
         try:
             return await loop.run_in_executor(None, _run)
         finally:
             self._inflight_agent_runs -= 1
+            self._release_session_turn_lease(turn_lease)
             if session_id and session_task is not None:
                 active = self._active_session_chats.get(session_id)
                 if active is not None:
@@ -6544,7 +6586,12 @@ class APIServerAdapter(BasePlatformAdapter):
         request_source = str(request.headers.get("X-Hermes-Session-Source", "")).strip()
 
         async def _run_and_close():
+            turn_lease = None
             try:
+                turn_lease = await self._acquire_session_turn_lease(
+                    session_id,
+                    owner_key=f"run:{run_id}",
+                )
                 self._set_run_status(run_id, "running")
                 if run_id in self._stopping_run_ids:
                     _put_event_if_active({
@@ -6774,6 +6821,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 except Exception:
                     pass
             finally:
+                self._release_session_turn_lease(turn_lease)
                 # If the asyncio wrapper is cancelled (for example via
                 # /stop), the executor thread can still be blocked waiting
                 # on an approval Event.  Unregistering here releases those
