@@ -309,6 +309,27 @@ def _request_service_tier(model_options: Any) -> Any:
     return _REQUEST_OPTION_MISSING
 
 
+def _request_output_budget(model_options: Any) -> Optional[int]:
+    """Return a validated per-request output-token cap, if supplied.
+
+    Machine-facing callers such as develop-machine need a larger bounded
+    hand-off than the ordinary interactive daemon default. Keep this narrow
+    and request-scoped: arbitrary AIAgent constructor options must not be
+    exposed through the OpenAI-compatible gateway, and a malformed value must
+    fall back to the configured daemon budget rather than causing a 500.
+    """
+    if not isinstance(model_options, dict):
+        return None
+    raw = model_options.get("max_output_tokens", model_options.get("max_tokens"))
+    if isinstance(raw, bool):
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if 1 <= value <= 131_072 else None
+
+
 def _apply_runtime_agent_overrides(
     runtime_kwargs: Dict[str, Any], overrides: Optional[Dict[str, Any]]
 ) -> Dict[str, Any]:
@@ -2618,6 +2639,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if request_reasoning_config is not None:
             reasoning_config = request_reasoning_config
         request_service_tier = _request_service_tier(model_options)
+        request_output_budget = _request_output_budget(model_options)
 
         request_model = _clean_request_string(requested_model)
         request_provider = _clean_request_string(requested_provider)
@@ -2863,6 +2885,11 @@ class APIServerAdapter(BasePlatformAdapter):
             "reasoning_config": reasoning_config,
             "gateway_session_key": gateway_session_key,
         }
+        if request_output_budget is not None:
+            # The API-server daemon's configured max_tokens is intentionally
+            # conservative for ordinary sessions. Bounded machine contracts
+            # may carry their own validated cap through model_options.
+            agent_kwargs["max_tokens"] = request_output_budget
         # Allow bounded API clients to request provider-level JSON mode without
         # exposing arbitrary agent constructor kwargs.  This is intentionally
         # opt-in and request-scoped; normal sessions keep the configured
@@ -3969,6 +3996,9 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         stream = _coerce_request_bool(body.get("stream"), default=False)
+        request_source = str(
+            request.headers.get("X-Hermes-Session-Source", "")
+        ).strip() or self._normalize_session_source(body.get("source") or "api_server")
 
         # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
         system_prompt = None
@@ -4179,6 +4209,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
+                session_source=request_source,
                 **agent_overrides,
                 route=route,
             ))
@@ -4200,6 +4231,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                session_source=request_source,
                 **agent_overrides,
                 route=route,
             )
@@ -6033,6 +6065,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_complete_callback=None,
         agent_ref: Optional[list] = None,
         gateway_session_key: Optional[str] = None,
+        session_source: str = "api_server",
         requested_model: Optional[str] = None,
         requested_provider: Optional[str] = None,
         model_options: Optional[Dict[str, Any]] = None,
@@ -6084,6 +6117,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     chat_id=session_id or "",
                     session_key=gateway_session_key or session_id or "",
                     session_id=session_id or "",
+                    source=session_source,
                 )
                 agent = None
                 try:
