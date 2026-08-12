@@ -7076,6 +7076,23 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception:
                 pass
             _reap_disconnected_agent_processes(agent, source="api_server_run_stop")
+        # The wrapper task owns the per-session turn lease.  Interrupting the
+        # agent alone does not release that lease while the executor thread is
+        # still unwinding, so a watchdog recovery turn can queue behind a run
+        # that has already disappeared from the run registry.  Cancel the
+        # asyncio wrapper as well; its finally block releases the lease and
+        # cleans the run indexes.  The executor's cooperative interrupt still
+        # runs independently in its worker thread.
+        current_task = asyncio.current_task()
+        task_cancel = getattr(task, "cancel", None)
+        task_done = getattr(task, "done", None)
+        if (
+            task is not None
+            and task is not current_task
+            and callable(task_cancel)
+            and (not callable(task_done) or not task_done())
+        ):
+            task_cancel()
         return True
 
     async def _sweep_orphaned_runs(self) -> None:

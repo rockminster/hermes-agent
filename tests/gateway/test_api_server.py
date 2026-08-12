@@ -682,6 +682,26 @@ class TestDisconnectedAgentReap:
         )
         db.delete_session.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_stop_run_cancels_wrapper_task_to_release_session_lease(self, adapter):
+        agent = MagicMock()
+        task = MagicMock()
+        task.done.return_value = False
+        adapter._active_run_agents["run_lease_stop"] = agent
+        adapter._active_run_tasks["run_lease_stop"] = task
+        adapter._run_statuses["run_lease_stop"] = {
+            "status": "running",
+            "session_id": "persisted-session-lease-stop",
+        }
+
+        request = MagicMock()
+        request.match_info = {"run_id": "run_lease_stop"}
+        with patch.object(adapter, "_ensure_session_db", return_value=MagicMock()):
+            response = await adapter._handle_stop_run(request)
+
+        assert response.status == 200
+        task.cancel.assert_called_once_with()
+
 
 class TestRunEventCallback:
 
