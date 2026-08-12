@@ -2142,11 +2142,15 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             defer_logical_completion=True,
         )
 
-    summary_request = (
-        "You've reached the maximum number of tool-calling iterations allowed. "
-        "Please provide a final response summarizing what you've found and accomplished so far, "
-        "without calling any more tools."
-    )
+    summary_request = getattr(agent, "_iteration_limit_summary_prompt", None)
+    if not isinstance(summary_request, str) or not summary_request.strip():
+        summary_request = (
+            "You've reached the maximum number of tool-calling iterations allowed. "
+            "Please provide a final response summarizing what you've found and accomplished so far, "
+            "without calling any more tools."
+        )
+    else:
+        summary_request = summary_request.strip()
     messages.append({"role": "user", "content": summary_request})
 
     try:

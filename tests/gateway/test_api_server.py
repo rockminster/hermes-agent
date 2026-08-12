@@ -662,6 +662,26 @@ class TestDisconnectedAgentReap:
         assert calls == [("run-stop-sess", frozenset(), "api_server_run_stop")]
         agent.interrupt.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_stop_run_ends_persisted_session_without_deleting_evidence(self, adapter):
+        agent = MagicMock()
+        adapter._active_run_agents["run_session_stop"] = agent
+        adapter._run_statuses["run_session_stop"] = {
+            "status": "running",
+            "session_id": "persisted-session-stop",
+        }
+        db = MagicMock()
+        with patch.object(adapter, "_ensure_session_db", return_value=db):
+            request = MagicMock()
+            request.match_info = {"run_id": "run_session_stop"}
+            response = await adapter._handle_stop_run(request)
+        assert response.status == 200
+        db.end_session.assert_called_once_with(
+            "persisted-session-stop",
+            "run stopped: Stop requested via API; evidence retained",
+        )
+        db.delete_session.assert_not_called()
+
 
 class TestRunEventCallback:
 

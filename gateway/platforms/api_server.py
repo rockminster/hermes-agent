@@ -2866,6 +2866,15 @@ class APIServerAdapter(BasePlatformAdapter):
             disabled_toolsets = None
 
         max_iterations = _current_max_iterations()
+        # Machine-readable contract turns can request a smaller tool-loop
+        # budget without weakening the gateway-wide default for normal
+        # sessions.  When the budget is reached AIAgent uses its existing
+        # tool-free finalisation path, which prevents bounded hand-offs from
+        # turning into unbounded discovery loops.
+        if isinstance(model_options, dict):
+            requested_max_iterations = model_options.get("max_iterations")
+            if isinstance(requested_max_iterations, int) and requested_max_iterations > 0:
+                max_iterations = min(max_iterations, requested_max_iterations)
 
         # Load fallback provider chain so the API server platform has the
         # same fallback behaviour as Telegram/Discord/Slack (fixes #4954).
@@ -2913,6 +2922,14 @@ class APIServerAdapter(BasePlatformAdapter):
             agent_kwargs["service_tier"] = request_service_tier
 
         agent = AIAgent(**agent_kwargs)
+        if isinstance(model_options, dict):
+            iteration_limit_prompt = model_options.get("iteration_limit_prompt")
+            if isinstance(iteration_limit_prompt, str) and iteration_limit_prompt.strip():
+                # Request-scoped machine contracts need a deterministic
+                # tool-free finalisation instruction when their bounded loop
+                # is exhausted. Keep the ordinary conversational summary
+                # unchanged for all other API callers.
+                agent._iteration_limit_summary_prompt = iteration_limit_prompt.strip()
         agent._hermes_api_runtime = {
             "provider": runtime_kwargs.get("provider") or getattr(agent, "provider", "") or "",
             "model": getattr(agent, "model", None) or model,
@@ -7037,6 +7054,22 @@ class APIServerAdapter(BasePlatformAdapter):
 
         self._set_run_status(run_id, "stopping", last_event="run.stopping")
         self._stopping_run_ids.add(run_id)
+        # A run stop is also the lifecycle boundary for the persisted Hermes
+        # session that owns the run. Keep its transcript/tool trace for
+        # diagnosis, but mark it ended immediately so the new-session
+        # watchdog cannot re-trigger cancelled work while the worker thread
+        # cooperatively unwinds.
+        session_id = (self._run_statuses.get(run_id) or {}).get("session_id")
+        if session_id:
+            try:
+                db = self._ensure_session_db()
+                if db is not None:
+                    db.end_session(
+                        session_id,
+                        f"run stopped: {reason}; evidence retained",
+                    )
+            except Exception:
+                logger.debug("failed to end stopped run session %s", session_id, exc_info=True)
         if agent is not None:
             try:
                 request_hard_interrupt(agent, reason)

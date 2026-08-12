@@ -193,6 +193,37 @@ async def test_run_agent_binds_api_session_context_for_tool_env(adapter, monkeyp
 
 
 @pytest.mark.asyncio
+async def test_run_agent_preserves_request_source_for_tool_env(adapter, monkeypatch):
+    """The chat gateway must carry an opaque caller source into the session."""
+    observed = {}
+
+    class FakeAgent:
+        session_prompt_tokens = 0
+        session_completion_tokens = 0
+        session_total_tokens = 0
+
+        def __init__(self, session_id: str):
+            self.session_id = session_id
+
+        def run_conversation(self, user_message, conversation_history, task_id):
+            from gateway.session_context import get_session_env
+
+            observed["source"] = get_session_env("HERMES_SESSION_SOURCE")
+            return {"final_response": "ok"}
+
+    monkeypatch.setattr(adapter, "_create_agent", lambda **kwargs: FakeAgent(kwargs["session_id"]))
+
+    await adapter._run_agent(
+        user_message="hello",
+        conversation_history=[],
+        session_id="contract-session",
+        session_source="develop-machine-contract",
+    )
+
+    assert observed["source"] == "develop-machine-contract"
+
+
+@pytest.mark.asyncio
 async def test_session_chat_stream_run_completed_carries_turn_transcript(adapter, session_db):
     """run.completed must include the full interleaved turn transcript so a
     client that lost intermediate (pre-tool-call) assistant text from the live
