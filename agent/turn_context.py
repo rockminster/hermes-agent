@@ -1175,7 +1175,14 @@ def build_turn_context(
         agent._interrupt_thread_signal_pending = False
 
     # Notify memory providers of the new turn (BEFORE prefetch_all).
-    if agent._memory_manager:
+    # API contract callers can disable persistent memory for a bounded
+    # machine-to-machine turn.  Tool filtering alone is insufficient: the
+    # prefetch path runs before tool construction and otherwise appends stale
+    # historical repository context to the prompt.  Keep normal user turns
+    # unchanged when the attribute is absent or the memory toolset is not
+    # explicitly disabled.
+    memory_disabled = "memory" in (getattr(agent, "disabled_toolsets", None) or [])
+    if agent._memory_manager and not memory_disabled:
         try:
             _turn_msg = original_user_message if isinstance(original_user_message, str) else ""
             agent._memory_manager.on_turn_start(agent._user_turn_count, _turn_msg)
@@ -1187,7 +1194,7 @@ def build_turn_context(
     # Skip prefetch on trivial prompts (greetings, acknowledgements) to
     # prevent memory-context injection on turns that carry no semantic signal.
     ext_prefetch_cache = ""
-    if agent._memory_manager:
+    if agent._memory_manager and not memory_disabled:
         try:
             _query = original_user_message if isinstance(original_user_message, str) else ""
             if not is_trivial_prompt(_query):

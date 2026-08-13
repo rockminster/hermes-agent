@@ -240,6 +240,16 @@ def test_prefetch_runs_for_substantive_user_message():
     assert ctx.ext_prefetch_cache == "REMEMBERED CONTEXT"
 
 
+def test_prefetch_is_skipped_when_memory_toolset_is_disabled():
+    """Machine contracts must not inherit persistent historical memory."""
+    agent, mm = _agent_with_memory_manager()
+    agent.disabled_toolsets = ["memory"]
+    ctx = _build(agent, user_message="implement the requested repository change")
+    mm.on_turn_start.assert_not_called()
+    mm.prefetch_all.assert_not_called()
+    assert ctx.ext_prefetch_cache == ""
+
+
 def test_turn_start_replaces_stale_parent_history_with_compression_child():
     agent = _FakeAgent()
     stale_history = [{"role": "user", "content": "stale parent"}]
@@ -363,7 +373,6 @@ def test_between_turns_refresh_adds_late_tool_when_servers_registered():
 
     assert "mcp_x_tool" in agent.valid_tool_names
     assert any(t["function"]["name"] == "mcp_x_tool" for t in agent.tools)
-
 
 
 
