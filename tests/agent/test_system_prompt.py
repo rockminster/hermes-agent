@@ -24,6 +24,7 @@ def _make_agent(**overrides):
         platform="",
         pass_session_id=False,
         session_id="",
+        disabled_toolsets=[],
     )
     base.update(overrides)
     return SimpleNamespace(**base)
@@ -266,3 +267,24 @@ class TestSkillsInVolatileBand:
         full = _build(build_system_prompt)
         assert full.index(_CONTEXT) < full.index(_SKILLS)
         assert full.index(_SKILLS) < full.index("Conversation started:")
+
+
+def test_disabled_memory_toolset_excludes_persistent_prompt_blocks():
+    memory_store = SimpleNamespace(
+        format_for_system_prompt=lambda kind: f"{kind.upper()}_MEMORY_SENTINEL",
+    )
+    memory_manager = SimpleNamespace(
+        build_system_prompt=lambda: "EXTERNAL_MEMORY_SENTINEL",
+    )
+    parts = _prompt_parts(
+        _make_agent(
+            _memory_store=memory_store,
+            _memory_manager=memory_manager,
+            _memory_enabled=True,
+            _user_profile_enabled=True,
+            disabled_toolsets=["memory"],
+        )
+    )
+    assert "MEMORY_MEMORY_SENTINEL" not in parts["volatile"]
+    assert "USER_MEMORY_SENTINEL" not in parts["volatile"]
+    assert "EXTERNAL_MEMORY_SENTINEL" not in parts["volatile"]

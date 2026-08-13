@@ -512,7 +512,12 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if skills_prompt:
         volatile_parts.append(skills_prompt)
 
-    if agent._memory_store:
+    # Request-scoped machine contracts may disable persistent memory.  The
+    # memory toolset gate must cover prompt assembly as well as tool schemas
+    # and turn prefetch; otherwise MEMORY.md/USER.md and external provider
+    # instructions still leak historical context into a bounded contract.
+    memory_disabled = "memory" in (getattr(agent, "disabled_toolsets", None) or [])
+    if agent._memory_store and not memory_disabled:
         if agent._memory_enabled:
             mem_block = agent._memory_store.format_for_system_prompt("memory")
             if mem_block:
@@ -524,7 +529,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
                 volatile_parts.append(user_block)
 
     # External memory provider system prompt block (additive to built-in)
-    if agent._memory_manager:
+    if agent._memory_manager and not memory_disabled:
         try:
             _ext_mem_block = agent._memory_manager.build_system_prompt()
             if _ext_mem_block:
