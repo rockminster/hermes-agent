@@ -36,6 +36,7 @@ Usage:
 import importlib.util
 import json
 import logging
+import math
 import os
 import platform
 import re
@@ -2563,6 +2564,24 @@ def terminal_tool(
         # Force run after user confirmation
         # Note: force parameter is internal only, not exposed to model API
     """
+    # Tool callers occasionally serialise the JSON-schema integer as a string.
+    # Normalise that boundary value before validation so a malformed argument
+    # cannot escape as a Python TypeError from the comparisons below. One bad
+    # timeout must become recoverable tool feedback, not a repeated terminal
+    # failure that abandons an otherwise healthy implementation session.
+    if isinstance(timeout, str):
+        try:
+            timeout = float(timeout.strip())
+        except ValueError:
+            return tool_error(
+                f"timeout must be a positive number of seconds (got {timeout!r})."
+            )
+    if timeout is not None and (
+        not isinstance(timeout, (int, float)) or not math.isfinite(timeout)
+    ):
+        return tool_error(
+            f"timeout must be a positive number of seconds (got {timeout!r})."
+        )
     try:
         if not isinstance(command, str):
             logger.warning(
