@@ -16,6 +16,7 @@ from tools.file_operations import (
     SearchMatch,
     LintResult,
     ShellFileOperations,
+    ExecuteResult,
     MAX_LINE_LENGTH,
     normalize_read_pagination,
     normalize_search_pagination,
@@ -278,6 +279,24 @@ class TestShellFileOpsHelpers:
     def test_normalize_read_pagination_clamps_invalid_values(self):
         assert normalize_read_pagination(offset=0, limit=0) == (1, 1)
         assert normalize_read_pagination(offset=-10, limit=-5) == (1, 1)
+
+    def test_existing_local_file_survives_transient_shell_probe_failure(self, tmp_path, monkeypatch):
+        from tools.environments.local import LocalEnvironment
+
+        path = tmp_path / "present.py"
+        path.write_text("first\nsecond\n", encoding="utf-8")
+        ops = ShellFileOperations(LocalEnvironment(cwd=str(tmp_path)))
+        monkeypatch.setattr(
+            ops,
+            "_exec",
+            lambda *_args, **_kwargs: ExecuteResult(stdout="probe failed", exit_code=1),
+        )
+
+        result = ops.read_file(str(path))
+
+        assert result.error is None
+        assert result.content == "1|first\n2|second"
+        assert result.total_lines == 2
         assert normalize_read_pagination(offset="bad", limit="bad") == (1, 2000)
         assert normalize_read_pagination(offset=2, limit=999999) == (2, 2000)
 
@@ -803,4 +822,3 @@ class TestByteLayerBinaryDetection:
         ops = ShellFileOperations(mock_env)
         result = ops.read_file("/tmp/a.out")
         assert result.is_binary is True
-

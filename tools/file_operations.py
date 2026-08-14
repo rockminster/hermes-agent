@@ -1343,6 +1343,17 @@ class ShellFileOperations(FileOperations):
         stat_result = self._exec(self._size_probe_cmd(path))
 
         if stat_result.exit_code != 0:
+            # A local shell probe can fail transiently while the host file is
+            # still present (for example when several model-issued read_file
+            # calls share a terminal environment). Do not turn that transport
+            # failure into a false "File not found" result: it causes the
+            # model to repeat the same call until the session watchdog aborts
+            # the work. LocalEnvironment has the same host filesystem, so a
+            # direct read is a safe, bounded recovery path. Remote/container
+            # backends deliberately continue through their normal path logic.
+            local_fallback = self._read_local_file_fallback(path, offset, limit)
+            if local_fallback is not None:
+                return local_fallback
             # File not found. Before failing, try unicode-equivalent
             # spellings — NFC/NFD, narrow no-break space, curly quotes
             # render identically in a terminal, so the model retyping a
@@ -1503,6 +1514,80 @@ class ShellFileOperations(FileOperations):
             file_size=file_size,
             truncated=truncated,
             hint=hint
+        )
+
+    def _read_local_file_fallback(
+        self, path: str, offset: int, limit: int
+    ) -> Optional[ReadResult]:
+        """Read an existing host file when its shell probe transiently fails."""
+        if self.env.__class__.__name__ != "LocalEnvironment":
+            return None
+        candidate = Path(path)
+        try:
+            if not candidate.is_file():
+                return None
+            data = candidate.read_bytes()
+        except OSError:
+            return None
+
+        file_size = len(data)
+        if self._is_image(path):
+            return ReadResult(
+                is_image=True,
+                is_binary=True,
+                file_size=file_size,
+                hint=(
+                    "Image file detected. Automatically redirected to vision_analyze tool. "
+                    "Use vision_analyze with this file path to inspect the image contents."
+                ),
+            )
+        if file_size == 0:
+            return ReadResult(content="", total_lines=0, file_size=0, hint="File is empty (0 bytes).")
+        if self._is_likely_binary_bytes(data[:1000]):
+            return ReadResult(
+                is_binary=True,
+                file_size=file_size,
+                error=describe_binary_file(data[:1000], file_size),
+            )
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            return ReadResult(
+                is_binary=True,
+                file_size=file_size,
+                error=describe_binary_file(data[:1000], file_size),
+            )
+        if offset == 1:
+            text, _ = _strip_bom(text)
+        lines = text.splitlines(keepends=True)
+        total_lines = len(lines)
+        end_line = offset + limit - 1
+        if offset > total_lines > 0:
+            return ReadResult(
+                content="",
+                total_lines=total_lines,
+                file_size=file_size,
+                hint=(
+                    f"Note: offset {offset} is beyond the end of the file "
+                    f"({total_lines} lines total). Retry with offset <= {total_lines}."
+                ),
+            )
+        page = "".join(lines[offset - 1:end_line])
+        truncated = total_lines > end_line
+        if not truncated and page.endswith("\n"):
+            page = page[:-1]
+        hint = (
+            f"Use offset={end_line + 1} to continue reading "
+            f"(showing {offset}-{end_line} of {total_lines} lines)"
+            if truncated
+            else None
+        )
+        return ReadResult(
+            content=self._add_line_numbers(page, offset),
+            total_lines=total_lines,
+            file_size=file_size,
+            truncated=truncated,
+            hint=hint,
         )
     
     def _unicode_variant_match(self, path: str) -> Optional[str]:
