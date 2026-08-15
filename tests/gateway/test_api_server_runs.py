@@ -22,6 +22,7 @@ from gateway.config import PlatformConfig
 from gateway.platforms.api_server import (
     APIServerAdapter,
     _approval_event_choices,
+    _request_toolset_overrides,
     cors_middleware,
     security_headers_middleware,
 )
@@ -49,6 +50,43 @@ def test_approval_event_choices_follow_backend_capabilities(
         smart_denied=smart_denied,
         allow_permanent=allow_permanent,
     ) == expected
+
+
+def test_request_toolset_overrides_honour_explicit_allowlist_and_denylist():
+    enabled, disabled = _request_toolset_overrides(
+        {
+            "enabled_toolsets": ["terminal"],
+            "disabled_toolsets": ["session_search"],
+        },
+        ["hermes-cli", "codebase-memory-mcp"],
+        ["memory"],
+    )
+
+    assert enabled == ["terminal"]
+    assert disabled == ["memory", "session_search"]
+
+
+def test_request_toolset_overrides_preserve_explicit_empty_allowlist():
+    enabled, disabled = _request_toolset_overrides(
+        {"enabled_toolsets": [], "disabled_toolsets": []},
+        ["hermes-cli"],
+        ["memory"],
+    )
+
+    assert enabled == []
+    # The configured denylist remains a safety floor for request overrides.
+    assert disabled == ["memory"]
+
+
+def test_request_toolset_overrides_keep_configured_defaults_for_legacy_callers():
+    enabled, disabled = _request_toolset_overrides(
+        None,
+        ["terminal", "file"],
+        ["memory"],
+    )
+
+    assert enabled == ["file", "terminal"]
+    assert disabled == ["memory"]
 
 
 def _make_adapter(api_key: str = "") -> APIServerAdapter:

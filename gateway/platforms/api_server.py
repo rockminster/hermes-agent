@@ -58,7 +58,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 # Sentinel returned by _resolve_request_profile when a /p/<profile>/ prefix
 # names a profile this gateway does not serve (→ 404). Distinct from None
@@ -308,6 +308,46 @@ def _request_service_tier(model_options: Any) -> Any:
     if "fast" in model_options:
         return "priority" if _coerce_request_bool(model_options.get("fast"), default=False) else None
     return _REQUEST_OPTION_MISSING
+
+
+def _request_toolset_overrides(
+    model_options: Any,
+    default_enabled: Iterable[str],
+    default_disabled: Iterable[str],
+) -> tuple[list[str], list[str]]:
+    """Resolve request-scoped toolset restrictions for native API runs.
+
+    ``/v1/runs`` accepts ``model_options`` for per-request model behaviour.
+    Toolset restrictions belong to the same request boundary: a caller that
+    explicitly sends ``enabled_toolsets`` must not silently receive the
+    API-server's global catalogue, and an explicit empty list must mean
+    "no toolsets" rather than "use defaults".  The global disabled list is
+    always retained as a safety floor and is combined with the request deny
+    list.
+
+    Older callers that do not send either field retain the configured
+    platform behaviour.
+    """
+    if not isinstance(model_options, dict):
+        return sorted({str(value) for value in default_enabled}), sorted(
+            {str(value) for value in default_disabled}
+        )
+
+    raw_enabled = model_options.get("enabled_toolsets", _REQUEST_OPTION_MISSING)
+    if raw_enabled is _REQUEST_OPTION_MISSING:
+        enabled = {str(value) for value in default_enabled}
+    elif isinstance(raw_enabled, list):
+        enabled = {str(value).strip() for value in raw_enabled if str(value).strip()}
+    else:
+        # A malformed request must not widen access to the configured default.
+        enabled = {str(value) for value in default_enabled}
+
+    raw_disabled = model_options.get("disabled_toolsets", _REQUEST_OPTION_MISSING)
+    disabled = {str(value) for value in default_disabled}
+    if isinstance(raw_disabled, list):
+        disabled.update(str(value).strip() for value in raw_disabled if str(value).strip())
+
+    return sorted(enabled), sorted(disabled)
 
 
 def _apply_runtime_agent_overrides(
@@ -2872,7 +2912,18 @@ class APIServerAdapter(BasePlatformAdapter):
             self._last_resolved_model["*"] = model
 
         user_config = _load_gateway_config()
-        enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
+        configured_enabled_toolsets = _get_platform_tools(user_config, "api_server")
+        configured_agent = user_config.get("agent") or {}
+        configured_disabled_toolsets = (
+            configured_agent.get("disabled_toolsets")
+            if isinstance(configured_agent, dict)
+            else []
+        ) or []
+        enabled_toolsets, disabled_toolsets = _request_toolset_overrides(
+            model_options,
+            configured_enabled_toolsets,
+            configured_disabled_toolsets,
+        )
 
         max_iterations = _current_max_iterations()
 
@@ -2917,6 +2968,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "fallback_model": fallback_model,
             "reasoning_config": reasoning_config,
             "gateway_session_key": gateway_session_key,
+            "disabled_toolsets": disabled_toolsets,
         }
         if request_service_tier is not _REQUEST_OPTION_MISSING:
             agent_kwargs["service_tier"] = request_service_tier
