@@ -266,6 +266,13 @@ def _clean_request_string(value: Any) -> Optional[str]:
     return cleaned or None
 
 
+def _request_positive_int(value: Any) -> Optional[int]:
+    """Return a positive integer request option, or ``None`` if invalid."""
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
 def _request_reasoning_config(model_options: Any) -> Optional[Dict[str, Any]]:
     """Translate browser/API model_options into AIAgent reasoning_config.
 
@@ -444,9 +451,20 @@ def _request_agent_overrides(
     if model and model != virtual_model and (provider or allow_bare_model):
         overrides["requested_model"] = model
 
+    requested_max_tokens = _request_positive_int(body.get("max_tokens"))
+    if requested_max_tokens is None:
+        requested_max_tokens = _request_positive_int(body.get("max_output_tokens"))
     model_options = body.get("model_options")
     if isinstance(model_options, dict):
         overrides["model_options"] = dict(model_options)
+        if requested_max_tokens is None:
+            requested_max_tokens = _request_positive_int(
+                model_options.get("max_output_tokens")
+            )
+        if requested_max_tokens is None:
+            requested_max_tokens = _request_positive_int(model_options.get("max_tokens"))
+    if requested_max_tokens is not None:
+        overrides["requested_max_tokens"] = requested_max_tokens
     return overrides
 
 
@@ -2644,6 +2662,7 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key: Optional[str] = None,
         requested_model: Optional[str] = None,
         requested_provider: Optional[str] = None,
+        requested_max_tokens: Optional[int] = None,
         model_options: Optional[Dict[str, Any]] = None,
         route: Optional[Dict[str, Any]] = None,
         session_model: Optional[str] = None,
@@ -2970,6 +2989,11 @@ class APIServerAdapter(BasePlatformAdapter):
             "gateway_session_key": gateway_session_key,
             "disabled_toolsets": disabled_toolsets,
         }
+        if requested_max_tokens is not None:
+            # A valid request budget must reach AIAgent.  Otherwise the
+            # configured model.max_tokens (often 8192) silently wins even
+            # when /v1/runs supplied a larger budget for a long coding turn.
+            agent_kwargs["max_tokens"] = requested_max_tokens
         if request_service_tier is not _REQUEST_OPTION_MISSING:
             agent_kwargs["service_tier"] = request_service_tier
 
@@ -6773,6 +6797,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         gateway_session_key=gateway_session_key,
                         requested_model=agent_overrides.get("requested_model"),
                         requested_provider=agent_overrides.get("requested_provider"),
+                        requested_max_tokens=agent_overrides.get("requested_max_tokens"),
                         model_options=agent_overrides.get("model_options"),
                         route=route,
                     )

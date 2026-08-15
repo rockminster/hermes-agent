@@ -22,6 +22,7 @@ from gateway.config import PlatformConfig
 from gateway.platforms.api_server import (
     APIServerAdapter,
     _approval_event_choices,
+    _request_agent_overrides,
     _request_toolset_overrides,
     cors_middleware,
     security_headers_middleware,
@@ -87,6 +88,28 @@ def test_request_toolset_overrides_keep_configured_defaults_for_legacy_callers()
 
     assert enabled == ["file", "terminal"]
     assert disabled == ["memory"]
+
+
+def test_request_agent_overrides_preserve_explicit_output_budget():
+    overrides = _request_agent_overrides(
+        {
+            "model": "Qwen3.8-27B-4bit",
+            "max_tokens": 16384,
+            "model_options": {"max_output_tokens": 4096},
+        },
+        virtual_model="hermes-agent",
+    )
+
+    assert overrides["requested_max_tokens"] == 16384
+
+
+def test_request_agent_overrides_accept_model_option_output_budget():
+    overrides = _request_agent_overrides(
+        {"model_options": {"max_output_tokens": 32768}},
+        virtual_model="hermes-agent",
+    )
+
+    assert overrides["requested_max_tokens"] == 32768
 
 
 def _make_adapter(api_key: str = "") -> APIServerAdapter:

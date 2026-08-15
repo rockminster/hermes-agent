@@ -255,14 +255,17 @@ class TestAdapterInit:
 
         adapter._create_agent(
             session_id="api-session",
+            requested_max_tokens=16384,
             model_options={
-                "enabled_toolsets": ["terminal"],
-                "disabled_toolsets": ["session_search"],
-            },
+            "enabled_toolsets": ["terminal"],
+            "disabled_toolsets": ["session_search"],
+            "max_output_tokens": 16384,
+        },
         )
 
         assert captured["enabled_toolsets"] == ["terminal"]
         assert captured["disabled_toolsets"] == ["session_search"]
+        assert captured["max_tokens"] == 16384
 
 
 # ---------------------------------------------------------------------------
