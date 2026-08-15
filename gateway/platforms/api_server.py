@@ -2476,6 +2476,58 @@ class APIServerAdapter(BasePlatformAdapter):
             logger.warning("[%s] failed to persist session runtime lock for %s", self.name, session_id, exc_info=True)
             return False
 
+    async def _ensure_run_session_model(
+        self,
+        session_id: str,
+        *,
+        model: Optional[str],
+        provider: Optional[str] = None,
+    ) -> bool:
+        """Persist the effective model before a structured run starts.
+
+        ``/v1/runs`` creates the AIAgent lazily in a background task.  The
+        agent used the request's model, but the session row could be created
+        first with the gateway default.  A watchdog continuation then read
+        that stale row and resumed the same session on the wrong model.  Only
+        fill a missing row here: an existing session is an explicit continuity
+        boundary and must keep its recorded model untouched.
+        """
+        clean_model = self._clean_runtime_id(model)
+        if not session_id or not clean_model:
+            return False
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return False
+        try:
+            existing = await asyncio.to_thread(db.get_session, session_id)
+            if existing:
+                return True
+            model_config = {
+                "gateway_runtime": {
+                    "model": clean_model,
+                    "provider": self._clean_runtime_id(provider, max_len=80),
+                }
+            }
+            await asyncio.to_thread(
+                db.create_session,
+                session_id,
+                "api_server",
+                model=clean_model,
+                model_config=model_config,
+            )
+            return True
+        except Exception:
+            # A concurrent AIAgent/session writer may win the insert race.
+            # Never overwrite its row or turn a successful run into a
+            # persistence-only failure.
+            logger.debug(
+                "[%s] structured run session model persistence skipped for %s",
+                self.name,
+                session_id,
+                exc_info=True,
+            )
+            return False
+
     @staticmethod
     def _parse_session_model_config(raw: Any) -> Dict[str, Any]:
         if isinstance(raw, dict):
@@ -6724,6 +6776,23 @@ class APIServerAdapter(BasePlatformAdapter):
 
         run_id = f"run_{uuid.uuid4().hex}"
         session_id = session_id or run_id
+        effective_session_model = (
+            _clean_request_string(route.get("model"))
+            if isinstance(route, dict) and route.get("model")
+            else _clean_request_string(agent_overrides.get("requested_model"))
+            or self._model_name
+        )
+        effective_session_provider = (
+            self._clean_runtime_id(agent_overrides.get("requested_provider"), max_len=80)
+            or self._clean_runtime_id(route.get("provider"), max_len=80)
+        ) if isinstance(route, dict) else self._clean_runtime_id(
+            agent_overrides.get("requested_provider"), max_len=80
+        )
+        session_model_prepared = await self._ensure_run_session_model(
+            session_id,
+            model=effective_session_model,
+            provider=effective_session_provider,
+        )
         # Approval queues gate host-side tool execution and must be isolated
         # per API run.  Client-provided session IDs and memory session keys are
         # conversation/memory scopes, not authorization namespaces: multiple
@@ -6801,6 +6870,12 @@ class APIServerAdapter(BasePlatformAdapter):
                         model_options=agent_overrides.get("model_options"),
                         route=route,
                     )
+                # The pre-created row is intentionally owned by this agent's
+                # run.  Mark it as established so AIAgent does not attempt a
+                # duplicate INSERT on its first turn.  Existing rows are
+                # likewise safe: the helper never overwrites their model.
+                if session_model_prepared:
+                    agent._session_db_created = True
                 self._active_run_agents[run_id] = agent
 
                 def _approval_notify(approval_data: Dict[str, Any]) -> None:

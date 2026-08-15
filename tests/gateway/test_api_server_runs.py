@@ -12,7 +12,7 @@ Covers:
 import asyncio
 import threading
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aiohttp import web
@@ -183,6 +183,30 @@ def auth_adapter():
 
 
 class TestStartRun:
+    @pytest.mark.asyncio
+    async def test_new_run_session_records_effective_model_for_recovery(self, adapter):
+        db = MagicMock()
+        db.get_session.return_value = None
+        with patch.object(adapter, "_ensure_session_db_async", new=AsyncMock(return_value=db)):
+            prepared = await adapter._ensure_run_session_model(
+                "run-session",
+                model="Qwen3.8-27B-4bit",
+                provider="custom",
+            )
+
+        assert prepared is True
+        db.create_session.assert_called_once_with(
+            "run-session",
+            "api_server",
+            model="Qwen3.8-27B-4bit",
+            model_config={
+                "gateway_runtime": {
+                    "model": "Qwen3.8-27B-4bit",
+                    "provider": "custom",
+                }
+            },
+        )
+
     @pytest.mark.asyncio
     async def test_start_returns_202(self, adapter):
         app = _create_runs_app(adapter)
